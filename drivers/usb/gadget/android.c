@@ -61,6 +61,9 @@
 #include "f_ccid.c"
 #include "f_mtp.c"
 #include "f_accessory.c"
+#include "f_hid.h"
+#include "f_hid_android_keyboard.c"
+#include "f_hid_android_mouse.c"
 #include "f_rndis.c"
 #include "rndis.c"
 #include "f_qc_ecm.c"
@@ -71,7 +74,6 @@
 #include "f_ecm.c"
 #include "u_ether.c"
 #include "u_qc_ether.c"
-#include "f_hid.c"
 #ifdef CONFIG_TARGET_CORE
 #endif
 #ifdef CONFIG_SND_PCM
@@ -81,6 +83,10 @@
 #include "f_ncm.c"
 #include "f_charger.c"
 #include "debug.h"
+#ifdef CONFIG_USB_NOTIFY_AND_DIAG_SWITCH
+#include <linux/usb_notify.h>
+static int diags=0;
+#endif
 
 MODULE_AUTHOR("Mike Lockwood");
 MODULE_DESCRIPTION("Android Composite USB Driver");
@@ -198,6 +204,9 @@ struct android_dev {
 	bool sw_connected;
 	bool suspended;
 	bool sw_suspended;
+#ifdef CONFIG_USB_NOTIFY_AND_DIAG_SWITCH
+	bool open_diag;
+#endif
 	char pm_qos[5];
 	struct pm_qos_request pm_qos_req_dma;
 	unsigned up_pm_qos_sample_sec;
@@ -416,7 +425,29 @@ enum android_device_state {
 	USB_SUSPENDED,
 	USB_RESUMED
 };
+#ifdef CONFIG_USB_NOTIFY_AND_DIAG_SWITCH
+struct android_dev *g_android_dev;
+static int usb_ms_notifier(struct notifier_block *self,
+	unsigned long action, void *data);
+static struct notifier_block usb_ms_notif = {
+	.notifier_call = 	usb_ms_notifier,
+};
 
+static int usb_ms_notifier(struct notifier_block *self,
+	unsigned long action, void *data)
+{
+	switch (action) {
+	case USB_MS_DEVICE_ADD:
+		break;
+	case USB_MS_DEVICE_REMOVE:
+		g_android_dev->open_diag=true;
+		schedule_work(&g_android_dev->work);
+		break;
+	}
+	diags=1;
+	return NOTIFY_OK;
+}
+#endif
 static void android_work(struct work_struct *data)
 {
 	struct android_dev *dev = container_of(data, struct android_dev, work);
@@ -427,6 +458,9 @@ static void android_work(struct work_struct *data)
 	char *configured[2]   = { "USB_STATE=CONFIGURED", NULL };
 	char *suspended[2]   = { "USB_STATE=SUSPENDED", NULL };
 	char *resumed[2]   = { "USB_STATE=RESUMED", NULL };
+#ifdef CONFIG_USB_NOTIFY_AND_DIAG_SWITCH
+	char *open_diag[2]   = { "USB_STATE=OPEN_DIAG", NULL };
+#endif
 	char **uevent_envp = NULL;
 	static enum android_device_state last_uevent, next_state;
 	unsigned long flags;
@@ -481,6 +515,14 @@ static void android_work(struct work_struct *data)
 								disconnected);
 			msleep(20);
 		}
+#ifdef CONFIG_USB_NOTIFY_AND_DIAG_SWITCH
+		if (dev->open_diag) {
+			dev->open_diag=false;
+			printk("send USB_STATE=OPEN_DIAG:\n");
+			kobject_uevent_env(&dev->dev->kobj, KOBJ_CHANGE,
+					open_diag);
+		}
+#endif
 		/*
 		 * Before sending out CONFIGURED uevent give function drivers
 		 * a chance to wakeup userspace threads and notify disconnect
@@ -496,7 +538,7 @@ static void android_work(struct work_struct *data)
 		}
 		pr_info("%s: sent uevent %s\n", __func__, uevent_envp[0]);
 	} else {
-		pr_info("%s: did not send uevent (%d %d %pK)\n", __func__,
+		pr_info("%s: did not send uevent (%d %d %p)\n", __func__,
 			 dev->connected, dev->sw_connected, cdev->config);
 	}
 }
@@ -1420,29 +1462,6 @@ static struct android_usb_function audio_function = {
 };
 #endif
 
-static int hid_function_init(struct android_usb_function *f,
-				 struct usb_composite_dev *cdev)
-{
-	return ghid_setup(cdev->gadget, 2);
-}
-
-static void hid_function_cleanup(struct android_usb_function *f)
-{
-	ghid_cleanup();
-}
-
-static int hid_function_bind_config(struct android_usb_function *f,
-					struct usb_configuration *c)
-{
-	return hidg_bind_config(c, NULL, 0);
-}
-
-static struct android_usb_function hid_function = {
-	.name		= "hid",
-	.init		= hid_function_init,
-	.cleanup	= hid_function_cleanup,
-	.bind_config	= hid_function_bind_config,
-};
 
 /* DIAG */
 static char diag_clients[32];	    /*enabled DIAG clients- "diag[,diag_mdm]" */
@@ -1854,19 +1873,6 @@ static int serial_function_bind_config(struct android_usb_function *f,
 			}
 		}
 	}
-	/*
-	 * Make sure we always have two serials ports initialized to allow
-	 * switching composition from 1 serial function to 2 serial functions.
-	 * Mark 2nd port to use tty if user didn't specify transport.
-	 */
-	if ((config->instances_on == 1) && !serial_initialized) {
-		err = gserial_init_port(ports, "tty", "serial_tty");
-		if (err) {
-			pr_err("serial: Cannot open port '%s'", "tty");
-			goto out;
-		}
-		config->instances_on++;
-	}
 
 	/* limit the serial ports init only for boot ports */
 	if (ports > config->instances_on)
@@ -1881,7 +1887,8 @@ static int serial_function_bind_config(struct android_usb_function *f,
 		goto out;
 	}
 
-	for (i = 0; i < config->instances_on; i++) {
+	config->instances_on = ports;
+	for (i = 0; i < ports; i++) {
 		config->f_serial_inst[i] = usb_get_function_instance("gser");
 		if (IS_ERR(config->f_serial_inst[i])) {
 			err = PTR_ERR(config->f_serial_inst[i]);
@@ -2221,7 +2228,28 @@ static ssize_t rndis_manufacturer_store(struct device *dev,
 		return size;
 	return -1;
 }
-
+#ifdef CONFIG_USB_NOTIFY_AND_DIAG_SWITCH
+static ssize_t diag_status_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	int ret;
+	ret=diags;
+	if (ret < 0){
+		printk(KERN_ERR "%s:  read diag_status data fail. \n", __func__);
+		return sprintf(buf, "%d\n", 0xffff);
+	}
+	return sprintf(buf, "%d\n", ret);
+}
+static ssize_t diag_status_store(struct device *dev,
+	struct device_attribute *attr, const char *buf,size_t count)
+{
+	int value;
+	sscanf(buf, "%d\n", &value);
+	diags=value;
+	return count;
+}
+static DEVICE_ATTR(diag_status, 0664, diag_status_show, diag_status_store);
+#endif
 static DEVICE_ATTR(manufacturer, S_IRUGO | S_IWUSR, rndis_manufacturer_show,
 						    rndis_manufacturer_store);
 
@@ -2507,14 +2535,13 @@ static int mass_storage_function_init(struct android_usb_function *f,
 	config->fsg.nluns = 1;
 	snprintf(name[0], MAX_LUN_NAME, "lun");
 	config->fsg.luns[0].removable = 1;
-
-	if (dev->pdata && dev->pdata->cdrom) {
+	/*if (dev->pdata && dev->pdata->cdrom) {	   
 		config->fsg.luns[config->fsg.nluns].cdrom = 1;
 		config->fsg.luns[config->fsg.nluns].ro = 1;
 		config->fsg.luns[config->fsg.nluns].removable = 0;
 		snprintf(name[config->fsg.nluns], MAX_LUN_NAME, "rom");
 		config->fsg.nluns++;
-	}
+	}*/
 
 	if (uicc_nluns > FSG_MAX_LUNS - config->fsg.nluns) {
 		uicc_nluns = FSG_MAX_LUNS - config->fsg.nluns;
@@ -2927,6 +2954,41 @@ static struct android_usb_function midi_function = {
 	.attributes	= midi_function_attributes,
 };
 #endif
+static int hid_function_init(struct android_usb_function *f, struct usb_composite_dev *cdev)
+{
+	return ghid_setup(cdev->gadget, 2);
+}
+
+static void hid_function_cleanup(struct android_usb_function *f)
+{
+	ghid_cleanup();
+}
+
+static int hid_function_bind_config(struct android_usb_function *f, struct usb_configuration *c)
+{
+	int ret;
+	printk(KERN_INFO "hid keyboard\n");
+	ret = hidg_bind_config(c, &ghid_device_android_keyboard, 0);
+	if (ret) {
+		pr_info("%s: hid_function_bind_config keyboard failed: %d\n", __func__, ret);
+		return ret;
+	}
+	printk(KERN_INFO "hid mouse\n");
+	ret = hidg_bind_config(c, &ghid_device_android_mouse, 1);
+	if (ret) {
+		pr_info("%s: hid_function_bind_config mouse failed: %d\n", __func__, ret);
+		return ret;
+	}
+	return 0;
+}
+
+static struct android_usb_function hid_function = {
+	.name		= "hid",
+	.init		= hid_function_init,
+	.cleanup	= hid_function_cleanup,
+	.bind_config	= hid_function_bind_config,
+};
+
 static struct android_usb_function *supported_functions[] = {
 	&ffs_function,
 	&mbim_function,
@@ -2950,10 +3012,10 @@ static struct android_usb_function *supported_functions[] = {
 	&ncm_function,
 	&mass_storage_function,
 	&accessory_function,
-	&hid_function,
 #ifdef CONFIG_SND_PCM
 	&audio_source_function,
 #endif
+       &hid_function,
 	&uasp_function,
 	&charger_function,
 #ifdef CONFIG_SND_RAWMIDI
@@ -3317,6 +3379,8 @@ functions_store(struct device *pdev, struct device_attribute *attr,
 		}
 	}
 
+	/* HID driver always enabled, it's the whole point of this kernel patch */
+	android_enable_function(dev, conf, "hid");
 	/* Free uneeded configurations if exists */
 	while (curr_conf->next != &dev->configs) {
 		conf = list_entry(curr_conf->next,
@@ -3573,6 +3637,9 @@ static struct device_attribute *android_usb_attributes[] = {
 	&dev_attr_pm_qos_state,
 	&dev_attr_state,
 	&dev_attr_remote_wakeup,
+#ifdef CONFIG_USB_NOTIFY_AND_DIAG_SWITCH
+	&dev_attr_diag_status,
+#endif
 	NULL
 };
 
@@ -3891,7 +3958,7 @@ static int usb_diag_update_pid_and_serial_num(u32 pid, const char *snum)
 		return -ENODEV;
 	}
 
-	pr_debug("%s: dload:%pK pid:%x serial_num:%s\n",
+	pr_debug("%s: dload:%p pid:%x serial_num:%s\n",
 				__func__, diag_dload, pid, snum);
 
 	/* update pid */
@@ -4054,7 +4121,12 @@ static int android_probe(struct platform_device *pdev)
 				__func__);
 		goto err_probe;
 	}
-
+#ifdef CONFIG_USB_NOTIFY_AND_DIAG_SWITCH
+	ret = usb_register_client(&usb_ms_notif);
+	if (ret)
+		printk( "Unable to register usb_notifier: %d\n",ret);
+	g_android_dev=android_dev;
+#endif
 	/* pm qos request to prevent apps idle power collapse */
 	android_dev->curr_pm_qos_state = NO_USB_VOTE;
 	if (pdata && pdata->pm_qos_latency[0]) {
@@ -4115,7 +4187,9 @@ static int android_remove(struct platform_device *pdev)
 		android_class = NULL;
 		usb_composite_unregister(&android_usb_driver);
 	}
-
+#ifdef CONFIG_USB_NOTIFY_AND_DIAG_SWITCH
+	usb_unregister_client(&usb_ms_notif);
+#endif
 	return 0;
 }
 
@@ -4174,3 +4248,4 @@ static void __exit cleanup(void)
 	platform_driver_unregister(&android_platform_driver);
 }
 module_exit(cleanup);
+
