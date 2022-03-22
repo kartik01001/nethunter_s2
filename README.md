@@ -39,7 +39,7 @@ Release Date | June 2016
 - Download Kernel Sources
 
 ```
-git clone --recursive https://github.com/kartik01001/nethunter_s2.git -b master
+git clone --recursive https://github.com/kartik01001/nethunter_s2.git -b lineage-18.1
 ```
 
 
