@@ -1,4 +1,5 @@
-***This Kernel is underdevelopement some features might and might not work for Nethunter***
+!!This kernel is Under Development, some features might and might not work for Nethunter!!    
+===============================
 
 LeEco Le 2 (s2) Nethunter Kernel     
 ===============================
